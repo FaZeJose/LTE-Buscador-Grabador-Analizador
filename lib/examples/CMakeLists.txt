@@ -8,6 +8,11 @@
 add_executable(synch_file synch_file.c)
 target_link_libraries(synch_file srsran_phy)
 
+# Decodificador LTE sobre archivos IQ (lo usa tools/analizador_iq). Programa aparte:
+# no modifica cell_search_plmn.
+add_executable(analizar_celda_iq analizar_celda_iq.cc)
+target_link_libraries(analizar_celda_iq srsran_phy srsran_common rrc_asn1 pthread)
+
 #################################################################
 # These can be compiled without UHD or graphics support
 #################################################################
@@ -60,6 +65,14 @@ if(RF_FOUND)
 
   add_executable(cell_search cell_search.c)
   target_link_libraries(cell_search srsran_phy srsran_common srsran_rf)
+
+ add_executable(cell_search_plmn cell_search_plmn.cc)
+ target_link_libraries(cell_search_plmn
+   srsran_phy
+   srsran_common
+   srsran_rf
+   pthread
+   rrc_asn1)
 
   add_executable(usrp_capture usrp_capture.c)
   target_link_libraries(usrp_capture srsran_phy srsran_rf)

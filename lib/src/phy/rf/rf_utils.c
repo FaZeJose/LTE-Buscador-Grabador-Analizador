@@ -83,11 +83,15 @@ int rf_mib_decoder(srsran_rf_t*       rf,
                    uint32_t           nof_rx_channels,
                    cell_search_cfg_t* config,
                    srsran_cell_t*     cell,
-                   float*             cfo)
+                   float*             cfo,
+                   uint32_t*          sfn,
+                   int*               sfn_offset)
 {
   int                  ret = SRSRAN_ERROR;
   srsran_ue_mib_sync_t ue_mib;
   uint8_t              bch_payload[SRSRAN_BCH_PAYLOAD_LEN] = {};
+  int                  decoded_sfn_offset = 0;
+  uint32_t             decoded_sfn = 0;
 
   if (srsran_ue_mib_sync_init_multi(&ue_mib, srsran_rf_recv_wrapper_cs, nof_rx_channels, (void*)rf)) {
     fprintf(stderr, "Error initiating srsran_ue_mib_sync\n");
@@ -115,13 +119,22 @@ int rf_mib_decoder(srsran_rf_t*       rf,
   }
 
   /* Find and decode MIB */
-  ret = srsran_ue_mib_sync_decode(&ue_mib, config->max_frames_pbch, bch_payload, &cell->nof_ports, NULL);
+  ret = srsran_ue_mib_sync_decode(
+      &ue_mib, config->max_frames_pbch, bch_payload, &cell->nof_ports, &decoded_sfn_offset);
   if (ret < 0) {
     ERROR("Error decoding MIB");
     goto clean_exit;
   }
   if (ret == 1) {
-    srsran_pbch_mib_unpack(bch_payload, cell, NULL);
+    srsran_pbch_mib_unpack(bch_payload, cell, &decoded_sfn);
+
+    if (sfn) {
+      *sfn = decoded_sfn;
+    }
+
+    if (sfn_offset) {
+      *sfn_offset = decoded_sfn_offset;
+    }
   }
 
   // Save CFO
@@ -240,7 +253,7 @@ int rf_search_and_decode_mib(srsran_rf_t*       rf,
   ret = rf_cell_search(rf, nof_rx_channels, config, force_N_id_2, cell, cfo);
   if (ret > 0) {
     printf("Decoding PBCH for cell %d (N_id_2=%d)\n", cell->id, cell->id % 3);
-    ret = rf_mib_decoder(rf, nof_rx_channels, config, cell, cfo);
+    ret = rf_mib_decoder(rf, nof_rx_channels, config, cell, cfo, NULL, NULL);
     if (ret < 0) {
       ERROR("Could not decode PBCH from CELL ID %d", cell->id);
       return SRSRAN_ERROR;

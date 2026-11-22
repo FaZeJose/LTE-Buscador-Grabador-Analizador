@@ -18,7 +18,13 @@ typedef struct SRSRAN_API {
 SRSRAN_API int rf_rssi_scan(srsran_rf_t* rf, float* freqs, float* rssi, int nof_bands, double fs, int nsamp);
 
 SRSRAN_API int
-rf_mib_decoder(srsran_rf_t* rf, uint32_t nof_rf_channels, cell_search_cfg_t* config, srsran_cell_t* cell, float* cfo);
+rf_mib_decoder(srsran_rf_t* rf,
+                uint32_t nof_rf_channels,
+                cell_search_cfg_t* config,
+                srsran_cell_t* cell,
+                float* cfo,
+                uint32_t* sfn,
+                int* sfn_offset);
 
 SRSRAN_API int rf_cell_search(srsran_rf_t*       rf,
                               uint32_t           nof_rf_channels,

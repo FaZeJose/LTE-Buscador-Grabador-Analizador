@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#07110a"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="none" stroke="#1f6b35" stroke-width="6"/>
+  <path d="M36 150 L60 150 L72 110 L86 190 L100 96 L114 176 L128 120 L142 160 L156 104 L170 186 L184 128 L196 150 L220 150"
+        fill="none" stroke="#2bff73" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="190" cy="66" r="26" fill="#ff3b3b"/>
+  <circle cx="190" cy="66" r="34" fill="none" stroke="#ff3b3b" stroke-opacity=".4" stroke-width="5"/>
+  <text x="44" y="78" font-family="DejaVu Sans Mono, monospace" font-weight="bold" font-size="40" fill="#2bff73">IQ</text>
+</svg>

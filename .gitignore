@@ -1,0 +1,21 @@
+# Compilación
+build/
+__pycache__/
+*.pyc
+
+# Binarios que se generan con install.sh
+tools/grabador_iq/rx_iq_grabador
+tools/analizador_iq/libpss_det.so
+
+# Respaldos locales
+*.backup
+*.backup_*
+*.bak
+*.bak_*
+lib/examples/cell_search_plmn_modificado.cc
+
+# Datos (grabaciones IQ y registros)
+*.iq
+*.cf32
+*.sigmf-data
+capturas_iq/

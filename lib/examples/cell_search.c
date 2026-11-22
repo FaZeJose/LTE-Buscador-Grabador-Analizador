@@ -216,7 +216,7 @@ int main(int argc, char** argv)
           srsran_cell_t cell;
           cell.id = found_cells[i].cell_id;
           cell.cp = found_cells[i].cp;
-          int ret = rf_mib_decoder(&rf, 1, &cell_detect_config, &cell, NULL);
+          int ret = rf_mib_decoder(&rf, 1, &cell_detect_config, &cell, NULL, NULL, NULL);
           if (ret < 0) {
             ERROR("Error decoding MIB");
             exit(-1);
