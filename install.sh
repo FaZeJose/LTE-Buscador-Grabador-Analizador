@@ -35,8 +35,15 @@ for p in "${PAQUETES[@]}"; do
 done
 if [ ${#FALTAN[@]} -gt 0 ]; then
   echo "Se instalarán: ${FALTAN[*]}"
-  sudo apt-get update
-  sudo apt-get install -y "${FALTAN[@]}"
+  # Un repositorio ajeno roto (clave GPG vencida, PPA caído) hace fallar
+  # "apt-get update" aunque los repositorios de Ubuntu estén bien: se avisa y
+  # se sigue; si de verdad falta algo, el "install" de abajo lo dirá.
+  if ! sudo apt-get update; then
+    echo "Aviso: 'apt-get update' terminó con errores (ver arriba: suele ser un"
+    echo "repositorio de otro programa, como Brave o un PPA). Se continúa igual."
+  fi
+  sudo apt-get install -y "${FALTAN[@]}" || \
+    error "no se pudieron instalar: ${FALTAN[*]}. Revisa los repositorios de apt (sudo apt-get update)."
 else
   echo "Todo instalado."
 fi

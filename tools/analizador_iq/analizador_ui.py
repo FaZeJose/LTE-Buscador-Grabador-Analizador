@@ -60,6 +60,11 @@ class Trabajo:
                 self.estado.update(n_bloques=ev["n_bloques"], banda=ev["banda"])
             self.n += 1
             self.eventos.append((self.n, ev))
+            # El registro completo queda en el .log del analisis: aqui solo los ultimos
+            # mensajes, para que la memoria no crezca con analisis largos.
+            if len(self.eventos) > 4000:
+                corte = self.n - 2000
+                self.eventos = [x for x in self.eventos if x[1].get("t") != "log" or x[0] > corte]
 
     def iniciar(self, c):
         if self.ocupado():

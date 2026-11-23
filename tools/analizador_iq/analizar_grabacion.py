@@ -109,6 +109,18 @@ def nombre_operador(plmns):
     return mejor or OP_DESCONOCIDO
 
 
+def ram_disponible():
+    """Bytes de RAM disponibles (MemAvailable)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 4 * 1024 ** 3
+
+
 def earfcn_a_hz(banda, n):
     f_low, n_offs, _, _ = TABLA_EARFCN_DL[banda]
     return (f_low + 0.1 * (n - n_offs)) * 1e6
@@ -163,29 +175,60 @@ def listar_sesiones(carpeta):
 
 # ------------------------------------------------------------------ lectura
 class Grabacion:
-    """Acceso a un bloque .iq como muestras complejas (memmap, sin cargar todo)."""
+    """Acceso a un bloque .iq como muestras complejas, leyendo solo el trozo pedido.
+
+    No usa memmap: con memmap cada pagina leida queda asociada al proceso y un
+    bloque de 14 GB acaba ocupando toda la RAM (y empuja lo demas a la swap).
+    Aqui se lee con pread y se avisa al kernel de que ese trozo ya no hace falta
+    (POSIX_FADV_DONTNEED), asi la memoria usada no crece con lo analizado.
+    """
 
     def __init__(self, meta):
         self.meta = meta
         self.fmt = meta["formato"]
         self.fs = float(meta["tasa_muestreo_sps"])
         self.fc = float(meta.get("frecuencia_real_hz") or meta["frecuencia_central_hz"])
-        dt = np.int16 if self.fmt == "sc16" else np.int8
+        self.dt = np.int16 if self.fmt == "sc16" else np.int8
+        self.bps = 2 * np.dtype(self.dt).itemsize          # bytes por muestra compleja
         self.esc = np.float32(1 / 32768 if self.fmt == "sc16" else 1 / 128)
-        self.raw = np.memmap(meta["_iq"], dtype=dt, mode="r")
-        self.n = self.raw.size // 2
         if abs(self.fs - 20e6) > 1:
             raise ValueError(f"Tasa {self.fs} no soportada (se espera 20 Msps)")
+        self.fd = os.open(meta["_iq"], os.O_RDONLY)
+        self.n = os.fstat(self.fd).st_size // self.bps
+        self._fadvise(0, 0, "POSIX_FADV_SEQUENTIAL")
+
+    def _fadvise(self, off, nb, consejo):
+        try:
+            os.posix_fadvise(self.fd, off, nb, getattr(os, consejo))
+        except (AttributeError, OSError):
+            pass
 
     def leer(self, s, n):
         """Muestras [s, s+n) como complex64; ceros fuera del archivo."""
         out = np.zeros(n, np.complex64)
         a, b = max(s, 0), min(s + n, self.n)
         if b > a:
-            r = np.asarray(self.raw[2 * a:2 * b], dtype=np.float32) * self.esc
-            out[a - s:b - s].real = r[0::2]
-            out[a - s:b - s].imag = r[1::2]
+            off, nb = a * self.bps, (b - a) * self.bps
+            buf = bytearray()
+            while len(buf) < nb:
+                trozo = os.pread(self.fd, nb - len(buf), off + len(buf))
+                if not trozo:
+                    break
+                buf += trozo
+            r = np.frombuffer(buf, self.dt, count=len(buf) // np.dtype(self.dt).itemsize)
+            r = r.astype(np.float32) * self.esc
+            m = len(r) // 2
+            out[a - s:a - s + m].real = r[0::2]
+            out[a - s:a - s + m].imag = r[1::2]
+            self._fadvise(off, nb, "POSIX_FADV_DONTNEED")
         return out
+
+    def cerrar(self):
+        if getattr(self, "fd", None) is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    __del__ = cerrar
 
 
 _LIB = None
@@ -228,8 +271,11 @@ def plantilla_pss(M, df):
     return P
 
 
-def extraer(g, t0, dur, f_off, rate):
-    """Extrae [t0, t0+dur) s desplazando f_off Hz a DC y remuestreando a 'rate' (canalizador FFT)."""
+def extraer(g, t0, dur, f_off, rate, archivo):
+    """Extrae [t0, t0+dur) s desplazando f_off Hz a DC y remuestreando a 'rate' (canalizador FFT).
+
+    Escribe el resultado (cf32) en 'archivo' trozo a trozo, sin juntarlo todo en RAM.
+    """
     M = int(round(N_FFT * rate / g.fs))
     df = g.fs / N_FFT
     kk = int(round(f_off / df))
@@ -237,7 +283,6 @@ def extraer(g, t0, dur, f_off, rate):
     s0 = int(t0 * g.fs)
     n_out = int(round(dur * rate))
     q = rate / g.fs
-    out = np.zeros(n_out + int(H * q) + 10, np.complex64)
     nb = min(M, N_FFT)
     m = np.arange(nb) - nb // 2
     # transicion suave en los bordes (acorta la respuesta del filtro "ladrillo")
@@ -249,20 +294,20 @@ def extraer(g, t0, dur, f_off, rate):
     idx = (kk + m) % N_FFT
     pos = 0
     s = s0 - OV // 2
-    while pos < n_out:
-        X = sfft.fft(g.leer(s, N_FFT), workers=-1)
-        Y = np.zeros(M, np.complex64)
-        Y[(m + M) % M] = X[idx] * tap
-        y = sfft.ifft(Y, workers=-1) * (M / N_FFT)
-        a, b = int(OV // 2 * q), int((OV // 2 + H) * q)
-        y = y[a:b] * np.exp(-2j * np.pi * kk * (s + OV // 2) / N_FFT)
-        out[pos:pos + len(y)] = y
-        pos += len(y)
-        s += H
-    out = out[:n_out]
-    if frac:
-        out *= np.exp(-2j * np.pi * frac * (s0 / g.fs + np.arange(n_out) / rate)).astype(np.complex64)
-    return out
+    a, b = int(OV // 2 * q), int((OV // 2 + H) * q)
+    with open(archivo, "wb") as f:
+        while pos < n_out:
+            X = sfft.fft(g.leer(s, N_FFT), workers=-1)
+            Y = np.zeros(M, np.complex64)
+            Y[(m + M) % M] = X[idx] * tap
+            y = sfft.ifft(Y, workers=-1) * (M / N_FFT)
+            y = (y[a:b] * np.exp(-2j * np.pi * kk * (s + OV // 2) / N_FFT))[:n_out - pos]
+            if frac:
+                y = y * np.exp(-2j * np.pi * frac * (s0 / g.fs + (pos + np.arange(len(y))) / rate))
+            y.astype(np.complex64).tofile(f)
+            pos += len(y)
+            s += H
+    return pos
 
 
 # ------------------------------------------------------------------ analisis
@@ -272,11 +317,22 @@ class Analizador:
         self.emitir = emitir
         self.parar = False
         self.celdas = {}        # (earfcn, pci) -> fila
-        self.tmp = Path(tempfile.mkdtemp(prefix="analizador_iq_", dir="/dev/shm"
-                                         if os.path.isdir("/dev/shm") else None))
+        # Trozos temporales para srsRAN: en /dev/shm (RAM, rapido) solo si sobra memoria;
+        # si no, en disco. Cada uno se borra en cuanto srsRAN termina con el.
+        en_ram = os.path.isdir("/dev/shm") and ram_disponible() > 4 * 1024 ** 3
+        base = "/dev/shm" if en_ram else Path.home() / ".cache" / "analizador_iq"
+        Path(base).mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="analizador_iq_", dir=base))
 
     def log(self, txt, nivel=""):
         self.emitir({"t": "log", "txt": txt, "nivel": nivel})
+
+    def hilos_decodificar(self):
+        """Decodificaciones en paralelo: segun nucleos y sin pasar del 40 % de la RAM libre
+        (cada una puede tener un trozo de hasta ventana_s a 23,04 Msps en cf32)."""
+        por_hilo = self.cfg.ventana_s * max(TASA_PRB.values()) * 8 + 300 * 1024 ** 2
+        por_ram = int(0.4 * ram_disponible() // por_hilo)
+        return max(1, min((os.cpu_count() or 2) // 2, por_ram))
 
     # --- candidatos ---
     def asignar_earfcn(self, sesion):
@@ -431,9 +487,8 @@ class Analizador:
             dur = min(cfg.ventana_s, g.n / g.fs - t_ini)
             if dur < 0.5:
                 continue
-            x = extraer(g, t_ini, dur, f_e + d - g.fc, 1.92e6)
             f1 = self.tmp / f"e{e}_n{nid2}_w{w}_mib.cf32"
-            x.tofile(f1)
+            extraer(g, t_ini, dur, f_e + d - g.fc, 1.92e6, f1)
             rm = self.decodificar(["-f", f1, "-m", "mib", "-p", cfg.psr_srsran, "-n", 200,
                                    "-x", cfg.tramas_mib])
             f1.unlink(missing_ok=True)
@@ -456,9 +511,8 @@ class Analizador:
                 if not rate:
                     continue
                 cfo_tot = d + r.get("cfo_hz", 0.0)
-                x2 = extraer(g, t_ini, dur, f_e + cfo_tot - g.fc, rate)
                 f2 = self.tmp / f"e{e}_p{r['pci']}_w{w}_sib.cf32"
-                x2.tofile(f2)
+                extraer(g, t_ini, dur, f_e + cfo_tot - g.fc, rate, f2)
                 args = ["-f", f2, "-m", "sib", "-c", r["pci"], "-r", r["prb"],
                         "-t", max(1, r["ports"]), "-s", cfg.intentos_sib1]
                 if r["cp"] == "ext":
@@ -638,7 +692,7 @@ class Analizador:
                 vistos.add((d["nid2"], d["earfcn"]))
                 trabajos.append(d)
             self.emitir({"t": "progreso", "fase": "decodificando", "pct": 0})
-            with cf.ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) // 2)) as ex:
+            with cf.ThreadPoolExecutor(max_workers=self.hilos_decodificar()) as ex:
                 fut = {ex.submit(self.intentar_celda, banda, i, g, d["earfcn"], d["nid2"],
                                  d["ventanas"], t_win): d for d in trabajos}
                 hechos = 0
@@ -729,9 +783,36 @@ def main():
         sys.exit("El modo lista necesita --earfcn")
 
     lock = threading.Lock()
+    # Registro y resultados en disco (junto a las grabaciones), no acumulados en RAM
+    base = Path(a.carpeta).expanduser() / f"analisis_{sesion['id']}_{time.strftime('%Y%m%d_%H%M%S')}"
+    f_log = open(str(base) + ".log", "w", encoding="utf-8", buffering=1)
+
+    def guardar_resultados(celdas):
+        cols = ["earfcn", "freq_mhz", "pci", "prb", "bw_mhz", "estado", "operador", "plmn", "mcc",
+                "mnc", "tac", "eci", "enb_id", "cell_local", "psr_max", "presencia_pct", "visible_s",
+                "doppler_rango_hz", "cfo_hz", "snr_db", "bloque", "banda", "cell_barred",
+                "freq_band", "ul_earfcn", "sched"]
+        filas = sorted(celdas, key=lambda f: (f["earfcn"], str(f["pci"])))
+        with open(str(base) + "_celdas.json", "w", encoding="utf-8") as f:
+            json.dump(filas, f, indent=1, ensure_ascii=False)
+        import csv
+        with open(str(base) + "_celdas.csv", "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for c in filas:
+                w.writerow([" a ".join(map(str, v)) if isinstance(v, list) else
+                            ("" if v is None else v) for v in (c.get(k) for k in cols)])
 
     def emitir(ev):
         with lock:
+            if ev["t"] == "log":
+                f_log.write(f"{time.strftime('%H:%M:%S')}  {ev['txt']}\n")
+            elif ev["t"] == "fin":
+                try:
+                    guardar_resultados(ev["celdas"])
+                    f_log.write(f"Resultados guardados en {base.name}_celdas.csv y .json\n")
+                except OSError as ex:
+                    f_log.write(f"No se pudieron guardar los resultados: {ex}\n")
             if a.eventos:
                 print(json.dumps(ev, ensure_ascii=False), flush=True)
             elif ev["t"] == "log":
@@ -757,10 +838,12 @@ def main():
         an.parar = True
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    an.log(f"Registro y resultados en {base}.log / _celdas.csv / _celdas.json")
     try:
         an.ejecutar(sesion)
     finally:
         shutil.rmtree(an.tmp, ignore_errors=True)
+        f_log.close()
 
 
 if __name__ == "__main__":
