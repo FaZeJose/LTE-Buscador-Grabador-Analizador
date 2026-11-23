@@ -846,6 +846,11 @@ int main(int argc, char** argv)
   uint32_t                      n_found_cells = 0;
   decoded_cell_info              decoded_cells[1024] = {};
   uint32_t                      n_decoded_cells = 0;
+  static bool                   sib_ok_de[1024] = {};  // por indice de results: SIB1 decodificado
+  static int                    dec_de[1024];          // por indice de results: indice en decoded_cells
+  for (int k = 0; k < 1024; ++k) {
+    dec_de[k] = -1;
+  }
 
   srsran_debug_handle_crash(argc, argv);
 
@@ -903,7 +908,11 @@ int main(int argc, char** argv)
   int n_off = (off_range_khz > 0 && off_step_khz > 0) ? (int)(2 * off_range_khz / off_step_khz) + 1 : 1;
   for (int step_idx = 0; step_idx < nof_freqs * n_off && !go_exit; step_idx++) {
     freq = step_idx / n_off;
-    double off_hz = (n_off > 1) ? (-off_range_khz + (step_idx % n_off) * off_step_khz) * 1e3 : 0.0;
+    // Orden del barrido: primero la frecuencia exacta (0) y luego +-k, +-2k...: una celda
+    // terrestre se prueba primero sin desplazamiento, que es donde mejor decodifica.
+    int    i_off  = step_idx % n_off;
+    int    m_off  = (i_off + 1) / 2;
+    double off_hz = (i_off == 0) ? 0.0 : ((i_off % 2) ? -m_off : m_off) * off_step_khz * 1e3;
     double rf_freq_hz = (double)channels[freq].fd * MHZ + off_hz;
     srsran_rf_set_rx_freq(&rf, 0, rf_freq_hz);
     INFO("Set rf_freq to %.3f MHz", (double)channels[freq].fd * MHZ / 1000000);
@@ -957,20 +966,26 @@ int main(int argc, char** argv)
         continue;
       }
 
-      bool duplicate = false;
+      // Si la celda ya se vio en este EARFCN: se salta solo si su SIB1 ya salio bien.
+      // Si no, se reintenta aqui (otro desplazamiento del barrido puede ser el bueno).
+      int previa = -1;
       for (uint32_t k = 0; k < n_found_cells; ++k) {
         if (results[k].dl_earfcn == channels[freq].id &&
             results[k].cell.id == cell.id) {
-          duplicate = true;
+          previa = (int)k;
           break;
         }
       }
-      if (duplicate) {
-        printf("  Celda PCI=%d ya procesada en EARFCN=%d.\n", cell.id, channels[freq].id);
+      if (previa >= 0 && sib_ok_de[previa]) {
+        printf("  Celda PCI=%d ya decodificada en EARFCN=%d.\n", cell.id, channels[freq].id);
         continue;
       }
+      if (previa >= 0) {
+        printf("  Celda PCI=%d sin SIB1 en el intento anterior: se reintenta con este desplazamiento.\n",
+               cell.id);
+      }
 
-      if (n_found_cells >= 1024) {
+      if (previa < 0 && n_found_cells >= 1024) {
         printf("Se alcanzo el limite de 1024 celdas.\n");
         go_exit = true;
         break;
@@ -982,7 +997,8 @@ int main(int argc, char** argv)
       current.dl_earfcn = channels[freq].id;
       current.power = found_cells[i].peak;
       current.cfo = search_cell_cfo;
-      results[n_found_cells++] = current;
+      int idx_res = (previa >= 0) ? previa : (int)n_found_cells++;
+      results[idx_res] = current;
 
       printf("  MIB OK: PCI=%d, %u PRB, %u puertos, CFO=%+.1f Hz\n",
              cell.id, cell.nof_prb, cell.nof_ports, search_cell_cfo);
@@ -997,10 +1013,15 @@ int main(int argc, char** argv)
         sib_ok    = decode_sib1_for_cell(&rf, current, &candidate);
       }
 
-      if (n_decoded_cells < 1024) {
+      sib_ok_de[idx_res] = sib_ok;
+      if (dec_de[idx_res] >= 0) {
+        decoded_cells[dec_de[idx_res]] = candidate;  // reemplaza el intento fallido
+        print_cell_box(&candidate, dec_de[idx_res] + 1);
+      } else if (n_decoded_cells < 1024) {
+        dec_de[idx_res]                 = (int)n_decoded_cells;
         decoded_cells[n_decoded_cells++] = candidate;
+        print_cell_box(&candidate, n_decoded_cells);
       }
-      print_cell_box(&candidate, n_decoded_cells);
 
       if (!sib_ok && !go_exit) {
         printf("  PCI=%d: SIB1 no decodificado. Continuando.\n", cell.id);

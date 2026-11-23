@@ -30,6 +30,7 @@ import concurrent.futures as cf
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -231,6 +232,92 @@ class Grabacion:
     __del__ = cerrar
 
 
+class Lector:
+    """Lee las tramas y calcula su FFT en un hilo aparte, por delante del consumidor.
+
+    Mientras el nucleo C procesa una trama, las siguientes ya se estan leyendo del
+    disco y transformando: los calculos son los mismos, solo se quitan las esperas.
+    Entrega (t, X, Xw): X = FFT de la trama (complex64), Xw = FFT con 'ventana'.
+    """
+
+    def __init__(self, g, tramas, ventana=None, crudo=True, parar=lambda: False,
+                 aleatorio=False, cola=6, desfase=0):
+        self.g, self.tramas, self.w, self.crudo, self.parar = g, tramas, ventana, crudo, parar
+        self.desfase = desfase
+        self.fin = False
+        self.q = queue.Queue(cola)
+        # Si solo se usa 1 de cada k tramas, que el kernel no lea por adelantado lo que
+        # se va a saltar (en un disco mecanico eso es casi leer el bloque entero).
+        g._fadvise(0, 0, "POSIX_FADV_RANDOM" if aleatorio else "POSIX_FADV_SEQUENTIAL")
+        self.hilo = threading.Thread(target=self._producir, daemon=True)
+        self.hilo.start()
+
+    def _poner(self, x):
+        while not self.fin:
+            try:
+                self.q.put(x, timeout=0.2)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _producir(self):
+        try:
+            for t in self.tramas:
+                if self.fin or self.parar():
+                    break
+                x = self.g.leer(t * H + self.desfase, N_FFT)
+                X = np.ascontiguousarray(sfft.fft(x), np.complex64) if self.crudo else None
+                Xw = sfft.fft(x * self.w) if self.w is not None else None
+                if not self._poner((t, X, Xw)):
+                    return
+        except BaseException as e:  # noqa: se reenvia al consumidor
+            self._poner(e)
+            return
+        self._poner(None)
+
+    def __iter__(self):
+        while True:
+            it = self.q.get()
+            if it is None:
+                return
+            if isinstance(it, BaseException):
+                raise it
+            yield it
+
+    def cerrar(self):
+        self.fin = True
+        self.hilo.join(timeout=5)
+        self.g._fadvise(0, 0, "POSIX_FADV_SEQUENTIAL")
+
+
+class Espectro:
+    """Acumula el espectrograma trama a trama (potencia media en 1024 bins)."""
+
+    def __init__(self, paso_tramas, filas_s, fs, nb=1024):
+        self.nb, self.paso, self.filas_s = nb, paso_tramas, filas_s
+        self.w = np.hanning(N_FFT).astype(np.float32)
+        self.tramas_fila = max(1, int(round(filas_s * fs / H)))
+        self.filas, self.acc, self.n = [], np.zeros(nb), 0
+
+    def agregar(self, X):
+        p = np.fft.fftshift(np.abs(X) ** 2).reshape(self.nb, -1).mean(1)
+        self.acc += p
+        self.n += 1
+        if self.n * self.paso >= self.tramas_fila:
+            self.filas.append(self.acc / self.n)
+            self.acc, self.n = np.zeros(self.nb), 0
+
+    def resultado(self):
+        filas = self.filas + ([self.acc / self.n] if self.n else [])
+        if not filas:
+            filas = [np.full(self.nb, 1e-30)]
+        w2 = self.w.sum() ** 2
+        F = 10 * np.log10(np.array(filas) / w2 + 1e-20)
+        mean_db = 10 * np.log10(np.mean(np.array(filas), 0) / w2 + 1e-20)
+        return {"filas": F, "mean_db": mean_db, "max_db": F.max(0), "fila_s": self.filas_s}
+
+
 _LIB = None
 
 
@@ -271,43 +358,83 @@ def plantilla_pss(M, df):
     return P
 
 
-def extraer(g, t0, dur, f_off, rate, archivo):
-    """Extrae [t0, t0+dur) s desplazando f_off Hz a DC y remuestreando a 'rate' (canalizador FFT).
+class _Canal:
+    """Un trozo a extraer: [t0, t0+dur) s, desplazado f_off Hz a DC y remuestreado a 'rate'."""
 
-    Escribe el resultado (cf32) en 'archivo' trozo a trozo, sin juntarlo todo en RAM.
-    """
-    M = int(round(N_FFT * rate / g.fs))
-    df = g.fs / N_FFT
-    kk = int(round(f_off / df))
-    frac = f_off - kk * df
-    s0 = int(t0 * g.fs)
-    n_out = int(round(dur * rate))
-    q = rate / g.fs
-    nb = min(M, N_FFT)
-    m = np.arange(nb) - nb // 2
-    # transicion suave en los bordes (acorta la respuesta del filtro "ladrillo")
-    tap = np.ones(nb, np.float32)
-    tw = max(8, nb // 40)
-    ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, tw))
-    tap[:tw] = ramp
-    tap[-tw:] = ramp[::-1]
-    idx = (kk + m) % N_FFT
-    pos = 0
-    s = s0 - OV // 2
-    a, b = int(OV // 2 * q), int((OV // 2 + H) * q)
-    with open(archivo, "wb") as f:
-        while pos < n_out:
-            X = sfft.fft(g.leer(s, N_FFT), workers=-1)
-            Y = np.zeros(M, np.complex64)
-            Y[(m + M) % M] = X[idx] * tap
-            y = sfft.ifft(Y, workers=-1) * (M / N_FFT)
-            y = (y[a:b] * np.exp(-2j * np.pi * kk * (s + OV // 2) / N_FFT))[:n_out - pos]
-            if frac:
-                y = y * np.exp(-2j * np.pi * frac * (s0 / g.fs + (pos + np.arange(len(y))) / rate))
-            y.astype(np.complex64).tofile(f)
-            pos += len(y)
-            s += H
-    return pos
+    def __init__(self, g, t0, dur, f_off, rate, archivo):
+        self.M = int(round(N_FFT * rate / g.fs))
+        df = g.fs / N_FFT
+        self.kk = int(round(f_off / df))
+        self.frac = f_off - self.kk * df
+        # inicio alineado a la reticula comun de tramas (como mucho 6 ms antes de t0)
+        self.s0 = (int(t0 * g.fs) // H) * H
+        self.n_out = int(round(dur * rate))
+        self.rate, self.fs, self.archivo = rate, g.fs, archivo
+        q = rate / g.fs
+        nb = min(self.M, N_FFT)
+        self.m = np.arange(nb) - nb // 2
+        # transicion suave en los bordes (acorta la respuesta del filtro "ladrillo")
+        tap = np.ones(nb, np.float32)
+        tw = max(8, nb // 40)
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, tw))
+        tap[:tw] = ramp
+        tap[-tw:] = ramp[::-1]
+        self.tap = tap
+        self.idx = (self.kk + self.m) % N_FFT
+        self.a, self.b = int(OV // 2 * q), int((OV // 2 + H) * q)
+        self.j0 = self.s0 // H
+        self.j1 = self.j0 + -(-self.n_out // (self.b - self.a))   # tramas necesarias
+        self.pos, self.f = 0, None
+
+    def agregar(self, j, X):
+        if self.f is None:
+            self.f = open(self.archivo, "wb")
+        Y = np.zeros(self.M, np.complex64)
+        Y[(self.m + self.M) % self.M] = X[self.idx] * self.tap
+        y = sfft.ifft(Y) * (self.M / N_FFT)
+        y = (y[self.a:self.b] * np.exp(-2j * np.pi * self.kk * (j * H) / N_FFT))[:self.n_out - self.pos]
+        if self.frac:
+            y = y * np.exp(-2j * np.pi * self.frac * (self.s0 / self.fs
+                                                      + (self.pos + np.arange(len(y))) / self.rate))
+        y.astype(np.complex64).tofile(self.f)
+        self.pos += len(y)
+        if j + 1 >= self.j1:
+            self.f.close()
+            self.f = None
+            return True
+        return False
+
+
+def extraer_varios(g, trozos, al_terminar=None, parar=lambda: False):
+    """Extrae varios trozos (_Canal) con UNA sola lectura del archivo: cada trama se lee
+    y se transforma una vez y se reparte a todos los trozos que la necesitan. Los trozos
+    se escriben a disco (cf32) a medida que se calculan; al completarse cada uno se
+    llama al_terminar(trozo)."""
+    if not trozos:
+        return
+    por_trama = {}
+    for c in trozos:
+        for j in range(c.j0, c.j1):
+            por_trama.setdefault(j, []).append(c)
+    lector = Lector(g, sorted(por_trama), desfase=-(OV // 2), parar=parar)
+    try:
+        for j, X, _ in lector:
+            for c in por_trama[j]:
+                if c.agregar(j, X) and al_terminar:
+                    al_terminar(c)
+    finally:
+        lector.cerrar()
+        for c in trozos:
+            if c.f is not None:
+                c.f.close()
+                c.f = None
+
+
+def extraer(g, t0, dur, f_off, rate, archivo):
+    """Extrae un solo trozo a 'archivo' (cf32). Devuelve las muestras escritas."""
+    c = _Canal(g, t0, dur, f_off, rate, archivo)
+    extraer_varios(g, [c])
+    return c.pos
 
 
 # ------------------------------------------------------------------ analisis
@@ -387,34 +514,23 @@ class Analizador:
 
     # --- etapa 0: espectrograma ---
     def espectrograma(self, g, paso_tramas=1, filas_s=0.25):
-        nb = 1024
         n_tramas = max(1, (g.n - OV) // H)
-        filas, fila_acc, fila_n = [], np.zeros(nb), 0
-        tramas_fila = max(1, int(round(filas_s * g.fs / H)))
-        mean_acc = np.zeros(nb)
-        max_acc = np.full(nb, -1e9)
-        w = np.hanning(N_FFT).astype(np.float32)
-        for t in range(0, n_tramas, paso_tramas):
-            if self.parar:
-                break
-            X = sfft.fft(g.leer(t * H, N_FFT) * w, workers=-1)
-            p = np.fft.fftshift(np.abs(X) ** 2).reshape(nb, -1).mean(1)
-            fila_acc += p
-            fila_n += 1
-            if fila_n * paso_tramas >= tramas_fila:
-                filas.append(fila_acc / fila_n)
-                fila_acc, fila_n = np.zeros(nb), 0
-            if t % 200 == 0:
-                self.emitir({"t": "progreso", "fase": "espectro", "pct": 100 * t / n_tramas})
-        if fila_n:
-            filas.append(fila_acc / fila_n)
-        F = 10 * np.log10(np.array(filas) / (w.sum() ** 2) + 1e-20)
-        mean_acc = 10 * np.log10(np.mean(np.array(filas), 0) / (w.sum() ** 2) + 1e-20)
-        max_acc = F.max(0)
-        return {"filas": F, "mean_db": mean_acc, "max_db": max_acc, "fila_s": filas_s}
+        esp = Espectro(paso_tramas, filas_s, g.fs)
+        lector = Lector(g, range(0, n_tramas, paso_tramas), ventana=esp.w, crudo=False,
+                        parar=lambda: self.parar, aleatorio=paso_tramas > 1)
+        try:
+            for t, _, Xw in lector:
+                esp.agregar(Xw)
+                if t % 40 == 0:
+                    self.emitir({"t": "progreso", "fase": "espectro", "pct": 100 * t / n_tramas})
+        finally:
+            lector.cerrar()
+        return esp.resultado()
 
     # --- etapa 1: deteccion PSS ---
-    def detectar(self, banda, g, earfcns, dopplers):
+    def detectar(self, banda, g, earfcns, dopplers, esp=None):
+        """Deteccion PSS. Si se pasa 'esp' (Espectro con paso 1), en la misma lectura del
+        archivo se calcula tambien el espectrograma (ahorra leer el bloque dos veces)."""
         df = g.fs / N_FFT
         M = int(round(N_FFT * DET_RATE / g.fs))  # 6144
         P = plantilla_pss(M, df)
@@ -438,22 +554,26 @@ class Analizador:
         o_pico = np.zeros((maxv, C * 3), np.int32)
         win = 0
         t0 = time.time()
+        # La lectura y la FFT de las tramas siguientes van en otro hilo mientras el
+        # nucleo C (que suelta el GIL) procesa la actual: mismos calculos, sin esperas.
+        lector = Lector(g, range(n_tramas), ventana=esp.w if esp else None,
+                        parar=lambda: self.parar)
         try:
-            for t in range(n_tramas):
-                if self.parar:
-                    break
-                X = np.ascontiguousarray(sfft.fft(g.leer(t * H, N_FFT), workers=-1), np.complex64)
+            for t, X, Xw in lector:
                 nv = L.det_trama(h, X.ctypes.data, o_psr.ctypes.data, o_pico.ctypes.data, maxv)
                 if nv:
                     k = min(nv, n_win - win)
                     psr[win:win + k] = o_psr[:k]
                     pico[win:win + k] = o_pico[:k]
                     win += k
+                if esp is not None:
+                    esp.agregar(Xw)
                 if t % 50 == 0:
                     vel = (t + 1) * H / g.fs / max(time.time() - t0, 1e-6)
                     self.emitir({"t": "progreso", "fase": "pss", "pct": 100 * t / n_tramas,
                                  "velocidad": round(vel, 2)})
         finally:
+            lector.cerrar()
             L.det_liberar(h)
         psr = psr[:win].T.reshape(C, 3, win)
         pico = pico[:win].T.reshape(C, 3, win)
@@ -475,51 +595,104 @@ class Analizador:
                     pass
         return res
 
-    def intentar_celda(self, banda, bloque_i, g, e, nid2, ventanas, t_win):
-        """Prueba a decodificar en los mejores momentos de una deteccion."""
+    def _extraer_y_decodificar(self, g, trozos, args_de, avance=None):
+        """Extrae los trozos en una lectura y los decodifica en paralelo a medida que salen.
+        Devuelve {id(trozo): resultados}. Limita los trozos pendientes en disco temporal."""
+        hilos = self.hilos_decodificar()
+        cupo = threading.Semaphore(2 * hilos)
+        res, futs = {}, []
+
+        def tarea(c):
+            try:
+                return self.decodificar(args_de(c))
+            finally:
+                Path(c.archivo).unlink(missing_ok=True)
+                cupo.release()
+
+        with cf.ThreadPoolExecutor(max_workers=hilos) as ex:
+            def listo(c):
+                cupo.acquire()
+                futs.append((c, ex.submit(tarea, c)))
+            extraer_varios(g, trozos, listo, parar=lambda: self.parar)
+            for n, (c, f) in enumerate(futs):
+                try:
+                    res[id(c)] = f.result()
+                except Exception as e:  # noqa
+                    self.log(f"Error decodificando: {e}", "err")
+                    res[id(c)] = []
+                if avance:
+                    avance(n + 1, len(futs))
+        return res
+
+    def decodificar_bloque(self, banda, bloque_i, g, trabajos, t_win):
+        """MIB y luego SIB1/SIB2 en los mejores momentos de cada deteccion.
+
+        Misma logica que probar ventana por ventana, pero los trozos de todas las
+        detecciones se sacan en una sola lectura del archivo (el disco era el cuello
+        de botella: antes cada intento releia 3 s de la banda completa)."""
         cfg = self.cfg
-        f_e = earfcn_a_hz(banda, e)
-        hechos = []
-        for (w, ps, d) in ventanas[:cfg.intentos]:
+        # 1) MIB en todas las ventanas de todas las detecciones
+        mib = []
+        for di, d in enumerate(trabajos):
+            f_e = earfcn_a_hz(banda, d["earfcn"])
+            for k, (w, ps, dop) in enumerate(d["ventanas"][:cfg.intentos]):
+                t_ini = max(0.0, w * t_win - 0.3)
+                dur = min(cfg.ventana_s, g.n / g.fs - t_ini)
+                if dur < 0.5:
+                    continue
+                c = _Canal(g, t_ini, dur, f_e + dop - g.fc, 1.92e6,
+                           self.tmp / f"e{d['earfcn']}_n{d['nid2']}_w{w}_mib.cf32")
+                c.di, c.k, c.w, c.dop, c.t_ini, c.dur = di, k, w, dop, t_ini, dur
+                mib.append(c)
+        res_mib = self._extraer_y_decodificar(
+            g, mib, lambda c: ["-f", c.archivo, "-m", "mib", "-p", cfg.psr_srsran, "-n", 200,
+                               "-x", cfg.tramas_mib],
+            lambda n, t: self.emitir({"t": "progreso", "fase": "decodificando", "pct": 60 * n / t}))
+        por_ventana = {(c.di, c.k): c for c in mib}
+        # 2) SIB: ventana a ventana (en orden), solo donde haga falta
+        hecho = [False] * len(trabajos)
+        for k in range(cfg.intentos):
             if self.parar:
                 break
-            t_ini = max(0.0, w * t_win - 0.3)
-            dur = min(cfg.ventana_s, g.n / g.fs - t_ini)
-            if dur < 0.5:
+            sib = []
+            for di, d in enumerate(trabajos):
+                c = por_ventana.get((di, k))
+                if hecho[di] or c is None:
+                    continue
+                f_e = earfcn_a_hz(banda, d["earfcn"])
+                for r in res_mib.get(id(c), []):
+                    if r.get("pci", -1) < 0 or r["pci"] % 3 != d["nid2"]:
+                        continue
+                    fila = self.fila(banda, bloque_i, d["earfcn"], r["pci"])
+                    fila["psr_srsran"] = max(fila.get("psr_srsran", 0), r["psr"])
+                    if not r["mib_ok"]:
+                        fila["estado"] = fila.get("estado") or "PCI (sin MIB)"
+                        continue
+                    fila.update(prb=r["prb"], bw_mhz=BW_PRB.get(r["prb"]), puertos=r["ports"],
+                                cp=r["cp"], phich=r.get("phich"), mib="OK")
+                    if fila.get("sib1") == "OK":
+                        hecho[di] = True
+                        continue
+                    rate = TASA_PRB.get(r["prb"])
+                    if not rate:
+                        continue
+                    cfo_tot = c.dop + r.get("cfo_hz", 0.0)
+                    cs = _Canal(g, c.t_ini, c.dur, f_e + cfo_tot - g.fc, rate,
+                                self.tmp / f"e{d['earfcn']}_p{r['pci']}_w{c.w}_sib.cf32")
+                    cs.di, cs.r, cs.fila, cs.cfo_tot, cs.t_ini = di, r, fila, cfo_tot, c.t_ini
+                    sib.append(cs)
+            if not sib:
                 continue
-            f1 = self.tmp / f"e{e}_n{nid2}_w{w}_mib.cf32"
-            extraer(g, t_ini, dur, f_e + d - g.fc, 1.92e6, f1)
-            rm = self.decodificar(["-f", f1, "-m", "mib", "-p", cfg.psr_srsran, "-n", 200,
-                                   "-x", cfg.tramas_mib])
-            f1.unlink(missing_ok=True)
-            for r in rm:
-                if r.get("pci", -1) < 0:
-                    continue
-                if r["pci"] % 3 != nid2:
-                    continue
-                fila = self.fila(banda, bloque_i, e, r["pci"])
-                fila["psr_srsran"] = max(fila.get("psr_srsran", 0), r["psr"])
-                if not r["mib_ok"]:
-                    fila["estado"] = fila.get("estado") or "PCI (sin MIB)"
-                    continue
-                fila.update(prb=r["prb"], bw_mhz=BW_PRB.get(r["prb"]), puertos=r["ports"],
-                            cp=r["cp"], phich=r.get("phich"), mib="OK")
-                if fila.get("sib1") == "OK":
-                    hechos.append(r["pci"])
-                    continue
-                rate = TASA_PRB.get(r["prb"])
-                if not rate:
-                    continue
-                cfo_tot = d + r.get("cfo_hz", 0.0)
-                f2 = self.tmp / f"e{e}_p{r['pci']}_w{w}_sib.cf32"
-                extraer(g, t_ini, dur, f_e + cfo_tot - g.fc, rate, f2)
-                args = ["-f", f2, "-m", "sib", "-c", r["pci"], "-r", r["prb"],
-                        "-t", max(1, r["ports"]), "-s", cfg.intentos_sib1]
-                if r["cp"] == "ext":
-                    args.append("-e")
-                rs = self.decodificar(args)
-                f2.unlink(missing_ok=True)
-                for s in rs:
+
+            def args_sib(cs):
+                r = cs.r
+                a = ["-f", cs.archivo, "-m", "sib", "-c", r["pci"], "-r", r["prb"],
+                     "-t", max(1, r["ports"]), "-s", cfg.intentos_sib1]
+                return a + (["-e"] if r["cp"] == "ext" else [])
+            res_sib = self._extraer_y_decodificar(g, sib, args_sib)
+            for cs in sib:
+                fila, cfo_tot, t_ini = cs.fila, cs.cfo_tot, cs.t_ini
+                for s in res_sib.get(id(cs), []):
                     fila["cfo_hz"] = round(cfo_tot + s.get("cfo_hz", 0.0), 1)
                     if s.get("snr_db", -99) > -99:
                         fila["snr_db"] = s["snr_db"]
@@ -541,10 +714,9 @@ class Analizador:
                                       "SIB1" if fila.get("sib1") == "OK" else "MIB")
                 self.emitir({"t": "celda", "fila": fila})
                 if fila.get("sib1") == "OK":
-                    hechos.append(r["pci"])
-            if hechos:
-                break
-        return hechos
+                    hecho[cs.di] = True
+            self.emitir({"t": "progreso", "fase": "decodificando",
+                         "pct": 60 + 40 * (k + 1) / cfg.intentos})
 
     def fila(self, banda, bloque_i, e, pci):
         k = (e, pci)
@@ -584,16 +756,24 @@ class Analizador:
                      + (f"  ⚠ grabado con {meta.get('overflows_O', 0)} overflows" if meta.get(
                          "overflows_O") else ""), "head")
             propios = sorted(e for e, b in asign.items() if b == i)
-            # Etapa 0
-            paso = 1 if cfg.modo != "auto" else 4
-            esp = self.espectrograma(g, paso_tramas=paso)
-            f_axis = [round((g.fc + (k - 512) * g.fs / 1024) / 1e6, 4) for k in (0, 1023)]
-            self.emitir({"t": "espectro", "i": i + 1, "f_mhz": f_axis, "fila_s": esp["fila_s"] * 1,
-                         "max_db": np.round(esp["max_db"], 1).tolist(),
-                         "mean_db": np.round(esp["mean_db"], 1).tolist(),
-                         "filas_db": np.round(esp["filas"][::max(1, len(esp["filas"]) // 400)], 0)
-                         .astype(np.int16).tolist(),
-                         "dur_s": dur})
+            # Etapa 0. En modo auto el espectrograma elige los candidatos y va primero (1 de
+            # cada 4 tramas); en los otros modos se calcula en la misma lectura que la PSS.
+            def emitir_espectro(esp):
+                f_axis = [round((g.fc + (k - 512) * g.fs / 1024) / 1e6, 4) for k in (0, 1023)]
+                self.emitir({"t": "espectro", "i": i + 1, "f_mhz": f_axis, "fila_s": esp["fila_s"] * 1,
+                             "max_db": np.round(esp["max_db"], 1).tolist(),
+                             "mean_db": np.round(esp["mean_db"], 1).tolist(),
+                             "filas_db": np.round(esp["filas"][::max(1, len(esp["filas"]) // 400)], 0)
+                             .astype(np.int16).tolist(),
+                             "dur_s": dur})
+            esp, esp_junto = None, None
+            if cfg.modo == "auto":
+                t_fase = time.time()
+                esp = self.espectrograma(g, paso_tramas=4)
+                emitir_espectro(esp)
+                self.log(f"Espectrograma en {time.time() - t_fase:.0f} s.")
+            else:
+                esp_junto = Espectro(1, 0.25, g.fs)
             # Candidatos
             if cfg.modo == "exhaustivo":
                 cand = set(propios)
@@ -610,11 +790,18 @@ class Analizador:
             cand = sorted(cand)
             if not cand:
                 self.log("Sin EARFCN candidatos en este bloque.", "warn")
+                if esp_junto is not None:
+                    emitir_espectro(self.espectrograma(g, paso_tramas=1))
                 continue
             self.log(f"Buscando PSS en {len(cand)} EARFCN × {len(dopplers)} Doppler "
                      f"({len(cand) * len(dopplers) * 3} correlaciones) durante {dur:.0f} s "
                      f"con integración de {cfg.integracion_ms:.0f} ms…")
-            canales, psr, pico, t_win = self.detectar(banda, g, cand, dopplers)
+            t_fase = time.time()
+            canales, psr, pico, t_win = self.detectar(banda, g, cand, dopplers, esp_junto)
+            t_pss = time.time() - t_fase
+            if esp_junto is not None:
+                emitir_espectro(esp_junto.resultado())
+            self.log(f"Detección PSS en {t_pss:.0f} s ({dur / max(t_pss, 1e-6):.2f}× tiempo real).")
             if self.parar:
                 break
             # Agrupar por EARFCN y N_id2: mejor Doppler por ventana
@@ -692,40 +879,33 @@ class Analizador:
                 vistos.add((d["nid2"], d["earfcn"]))
                 trabajos.append(d)
             self.emitir({"t": "progreso", "fase": "decodificando", "pct": 0})
-            with cf.ThreadPoolExecutor(max_workers=self.hilos_decodificar()) as ex:
-                fut = {ex.submit(self.intentar_celda, banda, i, g, d["earfcn"], d["nid2"],
-                                 d["ventanas"], t_win): d for d in trabajos}
-                hechos = 0
-                for f in cf.as_completed(fut):
-                    d = fut[f]
-                    hechos += 1
-                    try:
-                        pcis = f.result()
-                    except Exception as ex_:  # noqa
-                        self.log(f"Error decodificando EARFCN {d['earfcn']}: {ex_}", "err")
-                        pcis = []
-                    # anotar presencia/Doppler en las filas de esa deteccion
-                    for (e, pci), fila in self.celdas.items():
-                        if e == d["earfcn"] and isinstance(pci, int) and pci % 3 == d["nid2"]:
-                            fila.update(psr_max=d["psr_max"], presencia_pct=d["presencia_pct"],
-                                        visible_s=[d["t_s"][0], d["t_s"][-1]],
-                                        doppler_rango_hz=[min(d["doppler_hz"]), max(d["doppler_hz"])],
-                                        bloque=d["bloque"])
-                            self.emitir({"t": "celda", "fila": fila})
-                    if not any(e == d["earfcn"] and isinstance(pci, int) and pci % 3 == d["nid2"]
-                               for (e, pci) in self.celdas):
-                        fila = {"earfcn": d["earfcn"],
-                                "freq_mhz": round(earfcn_a_hz(banda, d["earfcn"]) / 1e6, 1),
-                                "pci": f"?(N_id2={d['nid2']})", "banda": banda, "bloque": d["bloque"],
-                                "mib": "-", "sib1": "-", "sib2": "-", "operador": "",
-                                "estado": "solo PSS", "psr_max": d["psr_max"],
-                                "presencia_pct": d["presencia_pct"],
-                                "visible_s": [d["t_s"][0], d["t_s"][-1]],
-                                "doppler_rango_hz": [min(d["doppler_hz"]), max(d["doppler_hz"])]}
-                        self.celdas[(d["earfcn"], fila["pci"])] = fila
+            t_fase = time.time()
+            self.decodificar_bloque(banda, i, g, trabajos, t_win)
+            for d in trabajos:
+                # anotar presencia/Doppler en las filas de esa deteccion
+                for (e, pci), fila in self.celdas.items():
+                    if e == d["earfcn"] and isinstance(pci, int) and pci % 3 == d["nid2"]:
+                        fila.update(psr_max=d["psr_max"], presencia_pct=d["presencia_pct"],
+                                    visible_s=[d["t_s"][0], d["t_s"][-1]],
+                                    doppler_rango_hz=[min(d["doppler_hz"]), max(d["doppler_hz"])],
+                                    bloque=d["bloque"])
                         self.emitir({"t": "celda", "fila": fila})
-                    self.emitir({"t": "progreso", "fase": "decodificando",
-                                 "pct": 100 * hechos / max(1, len(trabajos))})
+                if not any(e == d["earfcn"] and isinstance(pci, int) and pci % 3 == d["nid2"]
+                           for (e, pci) in self.celdas):
+                    fila = {"earfcn": d["earfcn"],
+                            "freq_mhz": round(earfcn_a_hz(banda, d["earfcn"]) / 1e6, 1),
+                            "pci": f"?(N_id2={d['nid2']})", "banda": banda, "bloque": d["bloque"],
+                            "mib": "-", "sib1": "-", "sib2": "-", "operador": "",
+                            "estado": "solo PSS", "psr_max": d["psr_max"],
+                            "presencia_pct": d["presencia_pct"],
+                            "visible_s": [d["t_s"][0], d["t_s"][-1]],
+                            "doppler_rango_hz": [min(d["doppler_hz"]), max(d["doppler_hz"])]}
+                    self.celdas[(d["earfcn"], fila["pci"])] = fila
+                    self.emitir({"t": "celda", "fila": fila})
+            self.emitir({"t": "progreso", "fase": "decodificando", "pct": 100})
+            if trabajos:
+                self.log(f"Decodificación (srsRAN) de {len(trabajos)} detección(es) en "
+                         f"{time.time() - t_fase:.0f} s.")
         self.log(f"Análisis terminado en {time.time() - t_total:.0f} s. Celdas: "
                  f"{sum(1 for f in self.celdas.values() if f.get('mib') == 'OK')} con MIB, "
                  f"{sum(1 for f in self.celdas.values() if f.get('sib1') == 'OK')} con SIB1.", "head")
